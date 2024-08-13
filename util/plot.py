@@ -3,15 +3,20 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QSlider, QProgressBar, QHBoxLayout, QCheckBox
 )
 from PyQt5.QtCore import QTimer, Qt
-from pyqtgraph import PlotWidget
 import pyqtgraph as pg
+from pyqtgraph import PlotWidget
+import asyncio
+from bleak import BleakClient
+import threading
 
 class SignalPlotter(QWidget):
-    def __init__(self, queue, max_points=500):
+    def __init__(self, raw_data_queue, rsp_data_queue, max_points=500):
         super().__init__()
-        self.queue = queue
+        self.queue = raw_data_queue
         self.data = []
         self.max_points = max_points
+
+        self.rsp_analysis_outcome = rsp_data_queue
 
         # Initialize PyQt UI
         self.init_ui()
@@ -20,6 +25,15 @@ class SignalPlotter(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
         self.timer.start(50)  # Update every 50 ms
+
+        # Initialize the loop and thread
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.start_asyncio_loop, args=(self.loop,), daemon=True)
+        self.thread.start()
+
+    def start_asyncio_loop(self, loop):
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
 
     def init_ui(self):
         # Create a vertical layout
@@ -82,6 +96,18 @@ class SignalPlotter(QWidget):
         # Add the horizontal layout to the main layout
         layout.addLayout(h_layout)
 
+        # Bluetooth device selection checkboxes
+        self.heart_rate_check = QCheckBox("Connect to Heart Rate Band")
+        self.respiration_band_check = QCheckBox("Connect to Respiration Band")
+        self.heart_rate_check.setVisible(False)
+        self.respiration_band_check.setVisible(False)
+        layout.addWidget(self.heart_rate_check)
+        layout.addWidget(self.respiration_band_check)
+
+        # Connect the checkboxes to their respective handlers
+        self.heart_rate_check.stateChanged.connect(self.connect_heart_rate_band)
+        self.respiration_band_check.stateChanged.connect(self.connect_respiration_band)
+
         # Progress bars for respiration strength, emotional stress, and disharmony
         self.respiration_strength_bar = QProgressBar()
         self.emotional_stress_bar = QProgressBar()
@@ -121,8 +147,12 @@ class SignalPlotter(QWidget):
     def toggle_bluetooth(self):
         if self.bluetooth_button.isChecked():
             self.bluetooth_button.setText("Bluetooth: ON")
+            self.heart_rate_check.setVisible(True)
+            self.respiration_band_check.setVisible(True)
         else:
             self.bluetooth_button.setText("Bluetooth: OFF")
+            self.heart_rate_check.setVisible(False)
+            self.respiration_band_check.setVisible(False)
 
     def toggle_manual_auto(self, state):
         if state == Qt.Checked:
@@ -142,6 +172,39 @@ class SignalPlotter(QWidget):
         else:
             self.massage_air_valve_switch.setText("Massage Air Valve: OFF")
 
+    async def connect_device(self, address, uuid, notification_handler):
+        async with BleakClient(address) as client:
+            await client.start_notify(uuid, notification_handler)
+            await asyncio.sleep(600)  # Subscribe for 600 seconds
+            await client.stop_notify(uuid)
+
+    def connect_heart_rate_band(self, state):
+        if state == Qt.Checked:
+            heart_rate_address = "D0:A4:69:B6:8F:A2"  # Replace with the actual MAC address
+            heart_rate_uuid = "00002a37-0000-1000-8000-00805f9b34fb"
+            asyncio.run_coroutine_threadsafe(
+                self.connect_device(heart_rate_address, heart_rate_uuid, self.heart_rate_notification_handler),
+                self.loop
+            )
+
+    def connect_respiration_band(self, state):
+        if state == Qt.Checked:
+            respiration_address = "XX:XX:XX:XX:XX:XX"  # Replace with the actual MAC address
+            respiration_uuid = "00002a38-0000-1000-8000-00805f9b34fb"  # Replace with the actual UUID
+            asyncio.run_coroutine_threadsafe(
+                self.connect_device(respiration_address, respiration_uuid, self.respiration_notification_handler),
+                self.loop
+            )
+
+    def heart_rate_notification_handler(self, sender, data):
+        heart_rate = data[1]
+        self.heart_rate_label.setText(f"Heart Rate: {heart_rate} BPM")
+        print(f"Heart Rate: {heart_rate} BPM")
+
+    def respiration_notification_handler(self, sender, data):
+        # Handle respiration data here
+        print(f"Respiration Data: {data}")
+
     def update_plot(self):
         while not self.queue.empty():
             data_point = self.queue.get()
@@ -152,9 +215,12 @@ class SignalPlotter(QWidget):
                     self.data.pop(0)
                 self.curve.setData(self.data)
 
-            if 'RSP_Rate' in data_point:
-                respiration_rate = data_point['RSP_Rate']
-                if respiration_rate is not None:
+            if not self.rsp_analysis_outcome.empty():
+                if not self.rsp_analysis_outcome.empty():
+                    rsp_signals, _ = self.rsp_analysis_outcome.get()
+
+                    # Extract and display the latest respiration rate
+                    respiration_rate = rsp_signals["RSP_Rate"].iloc[-1]  # Get the last value
                     self.rate_label.setText(f"Respiration Rate: {respiration_rate:.2f} breaths/min")
                 else:
                     self.rate_label.setText("Respiration Rate: N/A")
@@ -199,10 +265,12 @@ class SignalPlotter(QWidget):
     def start_plotting(self):
         self.show()
 
-def start_signal_plotter(queue):
+def start_signal_plotter(raw_data_queue, rsp_data_queue):
     try:
         app = QApplication(sys.argv)
-        plotter = SignalPlotter(queue)
+        plotter = SignalPlotter(raw_data_queue, rsp_data_queue)
+
+        # Start the GUI event loop
         plotter.start_plotting()
         sys.exit(app.exec_())
     except Exception as e:

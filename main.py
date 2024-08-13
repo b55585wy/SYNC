@@ -27,7 +27,7 @@ def main():
 
 
     # 启动信号绘图
-    start_signal_plotter(plot_raw_data_queue)
+    start_signal_plotter(plot_raw_data_queue,rsp_data_queue)
 
 
 if __name__ == '__main__':

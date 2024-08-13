@@ -23,7 +23,7 @@ def signal_analysis(processed_data_queue, rsp_data_queue):
             # 使用NeuroKit2进行呼吸信号分析
             try:
                 rsp_signals, info = rsp_process(rsp_signal=np.array(data_buffer[:window_size]), sampling_rate=50,
-                                                   report='txt')
+                                                   report = None,)
                 # 将分析结果放入rsp_data_queue
                 rsp_data_queue.put((rsp_signals, info))
 
