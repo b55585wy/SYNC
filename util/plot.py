@@ -12,7 +12,6 @@ import asyncio
 from bleak import BleakClient
 import threading
 
-
 class SignalPlotter(QWidget):
     def __init__(self, raw_data_queue, rsp_data_queue, max_points=500):
         super().__init__()
@@ -25,8 +24,15 @@ class SignalPlotter(QWidget):
         self.queue = raw_data_queue
         self.data = []
         self.max_points = max_points
-
+        self.consecutive_max = 0  # 用于跟踪连续100的计数器
+        self.consecutive_min = 0  # 用于跟踪连续0的计数器
+        self.waiting_for_opposite = False  # 用于跟踪是否在等待相反的值
         self.rsp_analysis_outcome = rsp_data_queue
+
+        self.respiration_rate_first_method = None  # 第一种方式计算的呼吸率
+        self.respiration_rate_second_method = None  # 第二种方式计算的呼吸率
+        self.accumulated_time = 0  # 累积时间，用于判断是否达到15秒
+        self.accumulated_respiration_rates = []  # 用于存储15秒内的呼吸率数据
 
         # Initialize a deque to store the last 500 filtered data points
         self.recent_filtered_values = deque(maxlen=500)
@@ -50,6 +56,16 @@ class SignalPlotter(QWidget):
         self.reminder_timer = QTimer()
         self.reminder_timer.timeout.connect(self.check_reminder)
         self.reminder_timer.start(10000)  # Trigger every 10 seconds
+
+        # Timer for accumulating 15 seconds of data
+        self.accumulation_timer = QTimer()
+        self.accumulation_timer.timeout.connect(self.accumulate_data)
+        self.accumulation_timer.start(50)  # 每50ms累积一次数据
+
+        # Timer for updating every 5 seconds
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.update_second_method_rate)
+        self.update_timer.start(5000)  # 每5秒更新一次呼吸率
 
         # Initialize PyQt UI
         self.init_ui()
@@ -146,7 +162,7 @@ class SignalPlotter(QWidget):
         for bar in [self.respiration_strength_bar, self.emotional_stress_bar, self.harmony_bar]:
             bar.setMinimum(0)
             bar.setMaximum(100)
-            bar.setValue(50)
+            bar.setValue(0)
             bar.setStyleSheet("QProgressBar::chunk { background-color: blue; }")
 
         layout.addWidget(QLabel("Respiration Strength:"))
@@ -248,76 +264,34 @@ class SignalPlotter(QWidget):
         else:
             print(f"Received invalid data: {data}")
 
-    def update_plot(self):
-        while not self.queue.empty():
-            data_point = self.queue.get()
+    def accumulate_data(self):
+        """每50ms累积一次数据，直到15秒"""
+        if self.accumulated_time < 5:
+            if not self.rsp_analysis_outcome.empty():
+                rsp_signals, _ = self.rsp_analysis_outcome.get()
+                self.accumulated_respiration_rates.append(rsp_signals["RSP_Rate"].iloc[-1])
+                self.accumulated_time += self.sampling_interval
+        else:
+            if not self.rsp_analysis_outcome.empty():
+                rsp_signals, _ = self.rsp_analysis_outcome.get()
+                self.accumulated_respiration_rates.append(rsp_signals["RSP_Rate"].iloc[-1])
+                self.accumulated_time += self.sampling_interval
+            # 当累积到15秒时，计算平均呼吸率并保存到第二种方式中
+            self.respiration_rate_second_method = np.mean(self.accumulated_respiration_rates)
+            self.accumulated_time = 0
+            self.accumulated_respiration_rates = []  # 重置累积数据
 
-            if 'filtered_data' in data_point:
-                self.data.append(data_point['filtered_data'])
-                if len(self.data) > self.max_points:
-                    self.data.pop(0)
-                self.curve.setData(self.data)
+    def update_second_method_rate(self):
+        """每5秒钟更新一次第二种方式的呼吸率，并与previous呼吸率进行比较"""
+        if self.respiration_rate_second_method is not None and self.respiration_rate_previous is not None:
+            self.update_harmony_bar_with_second_method()
 
-                filtered_value = data_point['filtered_data']
-                self.recent_filtered_values.append(filtered_value)
-
-                if len(self.recent_filtered_values) == self.recent_filtered_values.maxlen:
-                    self.avg_filtered_value = np.mean(self.recent_filtered_values)
-                    self.std_filtered_value = np.std(self.recent_filtered_values)
-
-                if not self.rsp_analysis_outcome.empty():
-                    rsp_signals, _ = self.rsp_analysis_outcome.get()
-                    if self.recording_duration < 0.2:
-                        self.respiration_rates.append(rsp_signals["RSP_Rate"].iloc[-1])
-                        self.respiration_clean.append(rsp_signals["RSP_Clean"].iloc[-1])
-                        self.recording_duration += self.sampling_interval
-
-                    elif self.recording_duration >= 0.2:
-                        self.avg_respiration_rate = np.mean(self.respiration_rates)
-                        self.std_respiration_rate = np.std(self.respiration_rates)
-                        self.avg_respiration_clean = np.mean(self.respiration_clean)
-                        self.std_respiration_clean = np.std(self.respiration_clean)
-                        respiration_rate = rsp_signals["RSP_Rate"].iloc[-1]
-                        self.respiration_rate_previous = respiration_rate
-                        self.rate_label.setText(f"Respiration Rate: {respiration_rate:.2f} breaths/min")
-                        self.update_rate_timer.start(10000)
-
-                if self.avg_filtered_value is not None and self.std_filtered_value is not None and self.std_filtered_value != 0:
-                    normalized_value = (filtered_value - self.avg_filtered_value) / self.std_filtered_value * 50 + 50
-                    normalized_value = max(0, min(100, normalized_value))
-                    self.respiration_strength_bar.setValue(int(normalized_value))
-
-                    self.update_bar_color_based_on_value(filtered_value)
-
-                    if normalized_value == 100 or normalized_value == 0:
-                        self.reach_max_and_min += 1
-                        if self.reach_max_and_min % 2 == 0:
-                            print(f'Count when reach max and min: {self.reach_max_and_min // 2}')
-                            self.update_harmony_bar()
-
-    def update_previous_respiration_rate(self):
-        if self.respiration_rate_previous is not None:
-            self.respiration_rate_previous = float(self.rate_label.text().split()[-2])
-
-    def update_bar_color_based_on_value(self, filtered_value):
-        if self.avg_filtered_value is None or self.std_filtered_value is None:
+    def update_harmony_bar_with_second_method(self):
+        if self.respiration_rate_second_method is None or self.respiration_rate_previous is None:
+            print("Respiration rate data is incomplete, skipping harmony update.")
             return
-
-        distance_from_avg = abs(filtered_value - self.avg_filtered_value)
-        if distance_from_avg > self.std_filtered_value:
-            distance_from_avg = self.std_filtered_value
-
-        r = int((distance_from_avg / self.std_filtered_value) * 255)
-        g = 0
-        b = 255 - r
-        self.respiration_strength_bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: rgb({r},{g},{b}); }}")
-
-    def update_harmony_bar(self):
-        if self.respiration_rate_previous is None:
-            return
-
-        current_rate = float(self.rate_label.text().split()[-2])
-        difference = abs(current_rate - self.respiration_rate_previous)
+        """使用第二种方式的呼吸率与previous呼吸率进行比较并更新和谐度"""
+        difference = abs(self.respiration_rate_second_method - self.respiration_rate_previous)
         percentage_difference = (difference / self.respiration_rate_previous) * 100
 
         if percentage_difference <= 5:
@@ -347,9 +321,92 @@ class SignalPlotter(QWidget):
         self.update_bar_color(self.harmony_bar, level)
 
         if level <= 50:
-            self.reminder_label.setText("Breathing too fast!" if current_rate > self.respiration_rate_previous else "Breathing too slow!")
+            self.reminder_label.setText("Breathing too fast!" if self.respiration_rate_second_method > self.respiration_rate_previous else "Breathing too slow!")
         else:
             self.reminder_label.setText("")
+
+    def update_plot(self):
+        while not self.queue.empty():
+            data_point = self.queue.get()
+
+            if 'filtered_data' in data_point:
+                self.data.append(data_point['filtered_data'])
+                if len(self.data) > self.max_points:
+                    self.data.pop(0)
+                self.curve.setData(self.data)
+
+                filtered_value = data_point['filtered_data']
+                self.recent_filtered_values.append(filtered_value)
+
+                if len(self.recent_filtered_values) == self.recent_filtered_values.maxlen:
+                    self.avg_filtered_value = np.mean(self.recent_filtered_values)
+                    self.std_filtered_value = np.std(self.recent_filtered_values)
+
+                if not self.rsp_analysis_outcome.empty():
+                    rsp_signals, _ = self.rsp_analysis_outcome.get()
+                    if self.recording_duration < 0.2:
+                        self.respiration_rates.append(rsp_signals["RSP_Rate"].iloc[-1])
+                        self.respiration_clean.append(rsp_signals["RSP_Clean"].iloc[-1])
+                        self.avg_respiration_rate = np.mean(self.respiration_rates)
+                        self.std_respiration_rate = np.std(self.respiration_rates)
+                        self.recording_duration += self.sampling_interval
+
+                    elif self.recording_duration >= 0.2:
+                        self.avg_respiration_rate = np.mean(self.respiration_rates)
+                        self.std_respiration_rate = np.std(self.respiration_rates)
+                        self.avg_respiration_clean = np.mean(self.respiration_clean)
+                        self.std_respiration_clean = np.std(self.respiration_clean)
+                        respiration_rate = rsp_signals["RSP_Rate"].iloc[-1]
+                        self.respiration_rate_previous = respiration_rate
+                        self.rate_label.setText(f"Respiration Rate: {respiration_rate:.1f} breaths/min")
+                        self.update_rate_timer.start(10000)
+
+                if self.avg_filtered_value is not None and self.std_filtered_value is not None and self.std_filtered_value != 0:
+                    normalized_value = (filtered_value - self.avg_filtered_value) / self.std_filtered_value * 50 + 50
+                    normalized_value = max(0, min(100, normalized_value))
+                    self.respiration_strength_bar.setValue(int(normalized_value))
+
+                    self.update_bar_color_based_on_value(filtered_value)
+
+                    # 更新以下部分
+                    if normalized_value == 100:
+                        if self.waiting_for_opposite and self.consecutive_min >= 5:
+                            self.reach_max_and_min += 1
+                            print(f'Count when reach max and min: {self.reach_max_and_min}')
+                            self.update_harmony_bar_with_second_method()  # 调用正确的方法
+                            self.waiting_for_opposite = False  # 重置等待状态
+                            self.consecutive_min = 0  # 重置 min 计数器
+                        else:
+                            self.consecutive_max += 1
+                            self.waiting_for_opposite = True  # 设置等待状态
+                    # 如果 normalized_value 为 0
+                    elif normalized_value == 0:
+                        if self.waiting_for_opposite and self.consecutive_max >= 5:
+                            self.reach_max_and_min += 1
+                            print(f'Count when reach max and min: {self.reach_max_and_min}')
+                            self.update_harmony_bar_with_second_method()  # 调用正确的方法
+                            self.waiting_for_opposite = False  # 重置等待状态
+                            self.consecutive_max = 0  # 重置 max 计数器
+                        else:
+                            self.consecutive_min += 1
+                            self.waiting_for_opposite = True  # 设置等待状态
+
+    def update_previous_respiration_rate(self):
+        if self.respiration_rate_previous is not None:
+            self.respiration_rate_previous = float(self.rate_label.text().split()[-2])
+
+    def update_bar_color_based_on_value(self, filtered_value):
+        if self.avg_filtered_value is None or self.std_filtered_value is None:
+            return
+
+        distance_from_avg = abs(filtered_value - self.avg_filtered_value)
+        if distance_from_avg > self.std_filtered_value:
+            distance_from_avg = self.std_filtered_value
+
+        r = int((distance_from_avg / self.std_filtered_value) * 255)
+        g = 0
+        b = 255 - r
+        self.respiration_strength_bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: rgb({r},{g},{b}); }}")
 
     def check_reminder(self):
         if self.harmony_bar.value() <= 50:
