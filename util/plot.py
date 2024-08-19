@@ -1,4 +1,7 @@
 import sys
+from collections import deque
+
+import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QSlider, QProgressBar, QHBoxLayout, QCheckBox
 )
@@ -9,14 +12,44 @@ import asyncio
 from bleak import BleakClient
 import threading
 
+
 class SignalPlotter(QWidget):
     def __init__(self, raw_data_queue, rsp_data_queue, max_points=500):
         super().__init__()
+        self.std_respiration_clean = None
+        self.avg_respiration_clean = None
+        self.std_respiration_rate = None
+        self.avg_respiration_rate = None
+        self.respiration_rates = []
+        self.respiration_clean = []
         self.queue = raw_data_queue
         self.data = []
         self.max_points = max_points
 
         self.rsp_analysis_outcome = rsp_data_queue
+
+        # Initialize a deque to store the last 500 filtered data points
+        self.recent_filtered_values = deque(maxlen=500)
+
+        # Other variables for tracking
+        self.avg_filtered_value = None
+        self.std_filtered_value = None
+        self.recording_duration = 0
+        self.sampling_interval = 50 / 1000  # 50 ms timer interval
+        self.respiration_rate_previous = None
+        self.harmony_updates = 0
+        self.harmony_reminders = 0
+        self.reach_max_and_min = 0
+
+        # Timer for delayed update of respiration_rate_previous
+        self.update_rate_timer = QTimer()
+        self.update_rate_timer.setSingleShot(True)
+        self.update_rate_timer.timeout.connect(self.update_previous_respiration_rate)
+
+        # Timer for reminders every 10 seconds
+        self.reminder_timer = QTimer()
+        self.reminder_timer.timeout.connect(self.check_reminder)
+        self.reminder_timer.start(10000)  # Trigger every 10 seconds
 
         # Initialize PyQt UI
         self.init_ui()
@@ -36,7 +69,6 @@ class SignalPlotter(QWidget):
         loop.run_forever()
 
     def init_ui(self):
-        # Create a vertical layout
         layout = QVBoxLayout()
 
         # Create the PlotWidget for signal plotting
@@ -45,7 +77,6 @@ class SignalPlotter(QWidget):
         self.plot_widget.setXRange(0, self.max_points)
         self.curve = self.plot_widget.plot(pen=pg.mkPen(color='b', width=2))
 
-        # Add plot widget to layout
         layout.addWidget(self.plot_widget)
 
         # Respiration rate label
@@ -90,10 +121,9 @@ class SignalPlotter(QWidget):
         self.force_slider.setTickInterval(1)
         self.force_slider.setTickPosition(QSlider.TicksBelow)
         self.force_slider.setToolTip("Adjust Force (1-10)")
-        self.force_slider.setVisible(False)  # Initially hidden until manual mode is selected
+        self.force_slider.setVisible(False)
         h_layout.addWidget(self.force_slider)
 
-        # Add the horizontal layout to the main layout
         layout.addLayout(h_layout)
 
         # Bluetooth device selection checkboxes
@@ -108,23 +138,28 @@ class SignalPlotter(QWidget):
         self.heart_rate_check.stateChanged.connect(self.connect_heart_rate_band)
         self.respiration_band_check.stateChanged.connect(self.connect_respiration_band)
 
-        # Progress bars for respiration strength, emotional stress, and disharmony
+        # Progress bars for respiration strength, emotional stress, and harmony
         self.respiration_strength_bar = QProgressBar()
         self.emotional_stress_bar = QProgressBar()
-        self.disharmony_bar = QProgressBar()
+        self.harmony_bar = QProgressBar()
 
-        for bar in [self.respiration_strength_bar, self.emotional_stress_bar, self.disharmony_bar]:
+        for bar in [self.respiration_strength_bar, self.emotional_stress_bar, self.harmony_bar]:
             bar.setMinimum(0)
             bar.setMaximum(100)
-            bar.setValue(50)  # Default value
+            bar.setValue(50)
             bar.setStyleSheet("QProgressBar::chunk { background-color: blue; }")
 
         layout.addWidget(QLabel("Respiration Strength:"))
         layout.addWidget(self.respiration_strength_bar)
         layout.addWidget(QLabel("Emotional Stress:"))
         layout.addWidget(self.emotional_stress_bar)
-        layout.addWidget(QLabel("Disharmony:"))
-        layout.addWidget(self.disharmony_bar)
+        layout.addWidget(QLabel("Harmony:"))
+        layout.addWidget(self.harmony_bar)
+
+        # Reminder label
+        self.reminder_label = QLabel("")
+        self.reminder_label.setStyleSheet("font-size: 16px; color: red;")
+        layout.addWidget(self.reminder_label)
 
         # Add bottom switches for Dimension Measurement and Massage Air Valve
         bottom_layout = QHBoxLayout()
@@ -156,9 +191,9 @@ class SignalPlotter(QWidget):
 
     def toggle_manual_auto(self, state):
         if state == Qt.Checked:
-            self.force_slider.setVisible(True)  # Show slider if manual mode is selected
+            self.force_slider.setVisible(True)
         else:
-            self.force_slider.setVisible(False)  # Hide slider if auto mode is selected
+            self.force_slider.setVisible(False)
 
     def toggle_dimension_measurement(self):
         if self.dimension_measurement_switch.isChecked():
@@ -175,12 +210,12 @@ class SignalPlotter(QWidget):
     async def connect_device(self, address, uuid, notification_handler):
         async with BleakClient(address) as client:
             await client.start_notify(uuid, notification_handler)
-            await asyncio.sleep(600)  # Subscribe for 600 seconds
+            await asyncio.sleep(600)
             await client.stop_notify(uuid)
 
     def connect_heart_rate_band(self, state):
         if state == Qt.Checked:
-            heart_rate_address = "D0:A4:69:B6:8F:A2"  # Replace with the actual MAC address
+            heart_rate_address = "D0:A4:69:B6:8F:A2"
             heart_rate_uuid = "00002a37-0000-1000-8000-00805f9b34fb"
             asyncio.run_coroutine_threadsafe(
                 self.connect_device(heart_rate_address, heart_rate_uuid, self.heart_rate_notification_handler),
@@ -189,8 +224,8 @@ class SignalPlotter(QWidget):
 
     def connect_respiration_band(self, state):
         if state == Qt.Checked:
-            respiration_address = "XX:XX:XX:XX:XX:XX"  # Replace with the actual MAC address
-            respiration_uuid = "00002a38-0000-1000-8000-00805f9b34fb"  # Replace with the actual UUID
+            respiration_address = "f0:f5:bd:b5:6a:f6"
+            respiration_uuid = "FF01"
             asyncio.run_coroutine_threadsafe(
                 self.connect_device(respiration_address, respiration_uuid, self.respiration_notification_handler),
                 self.loop
@@ -202,8 +237,16 @@ class SignalPlotter(QWidget):
         print(f"Heart Rate: {heart_rate} BPM")
 
     def respiration_notification_handler(self, sender, data):
-        # Handle respiration data here
-        print(f"Respiration Data: {data}")
+        if len(data) > 1:
+            length = data[0]
+            if len(data) >= length + 1:
+                imu_data = data[1:length + 1]
+                x_acc = int.from_bytes(imu_data, byteorder='little', signed=False)
+                print(f"IMU X-Axis Data: {x_acc}")
+            else:
+                print(f"Received incomplete data: {data}")
+        else:
+            print(f"Received invalid data: {data}")
 
     def update_plot(self):
         while not self.queue.empty():
@@ -215,55 +258,112 @@ class SignalPlotter(QWidget):
                     self.data.pop(0)
                 self.curve.setData(self.data)
 
-            if not self.rsp_analysis_outcome.empty():
+                filtered_value = data_point['filtered_data']
+                self.recent_filtered_values.append(filtered_value)
+
+                if len(self.recent_filtered_values) == self.recent_filtered_values.maxlen:
+                    self.avg_filtered_value = np.mean(self.recent_filtered_values)
+                    self.std_filtered_value = np.std(self.recent_filtered_values)
+
                 if not self.rsp_analysis_outcome.empty():
                     rsp_signals, _ = self.rsp_analysis_outcome.get()
+                    if self.recording_duration < 0.2:
+                        self.respiration_rates.append(rsp_signals["RSP_Rate"].iloc[-1])
+                        self.respiration_clean.append(rsp_signals["RSP_Clean"].iloc[-1])
+                        self.recording_duration += self.sampling_interval
 
-                    # Extract and display the latest respiration rate
-                    respiration_rate = rsp_signals["RSP_Rate"].iloc[-1]  # Get the last value
-                    self.rate_label.setText(f"Respiration Rate: {respiration_rate:.2f} breaths/min")
-                else:
-                    self.rate_label.setText("Respiration Rate: N/A")
+                    elif self.recording_duration >= 0.2:
+                        self.avg_respiration_rate = np.mean(self.respiration_rates)
+                        self.std_respiration_rate = np.std(self.respiration_rates)
+                        self.avg_respiration_clean = np.mean(self.respiration_clean)
+                        self.std_respiration_clean = np.std(self.respiration_clean)
+                        respiration_rate = rsp_signals["RSP_Rate"].iloc[-1]
+                        self.respiration_rate_previous = respiration_rate
+                        self.rate_label.setText(f"Respiration Rate: {respiration_rate:.2f} breaths/min")
+                        self.update_rate_timer.start(10000)
 
-            if 'IMU_Data' in data_point:
-                imu_data = data_point['IMU_Data']
-                self.imu_label.setText(f"IMU Data: {imu_data}")
+                if self.avg_filtered_value is not None and self.std_filtered_value is not None and self.std_filtered_value != 0:
+                    normalized_value = (filtered_value - self.avg_filtered_value) / self.std_filtered_value * 50 + 50
+                    normalized_value = max(0, min(100, normalized_value))
+                    self.respiration_strength_bar.setValue(int(normalized_value))
 
-            if 'Angular_Acceleration' in data_point:
-                angular_acc = data_point['Angular_Acceleration']
-                self.angular_acc_label.setText(f"Angular Acceleration: {angular_acc}")
+                    self.update_bar_color_based_on_value(filtered_value)
 
-            if 'Heart_Rate' in data_point:
-                heart_rate = data_point['Heart_Rate']
-                if heart_rate is not None:
-                    self.heart_rate_label.setText(f"Heart Rate: {heart_rate} BPM")
-                else:
-                    self.heart_rate_label.setText("Heart Rate: N/A")
+                    if normalized_value == 100 or normalized_value == 0:
+                        self.reach_max_and_min += 1
+                        if self.reach_max_and_min % 2 == 0:
+                            print(f'Count when reach max and min: {self.reach_max_and_min // 2}')
+                            self.update_harmony_bar()
 
-            if 'Respiration_Strength' in data_point:
-                strength = data_point['Respiration_Strength']
-                self.respiration_strength_bar.setValue(strength)
-                self.update_bar_color(self.respiration_strength_bar, strength)
+    def update_previous_respiration_rate(self):
+        if self.respiration_rate_previous is not None:
+            self.respiration_rate_previous = float(self.rate_label.text().split()[-2])
 
-            if 'Emotional_Stress' in data_point:
-                stress = data_point['Emotional_Stress']
-                self.emotional_stress_bar.setValue(stress)
-                self.update_bar_color(self.emotional_stress_bar, stress)
+    def update_bar_color_based_on_value(self, filtered_value):
+        if self.avg_filtered_value is None or self.std_filtered_value is None:
+            return
 
-            if 'Disharmony' in data_point:
-                disharmony = data_point['Disharmony']
-                self.disharmony_bar.setValue(disharmony)
-                self.update_bar_color(self.disharmony_bar, disharmony)
+        distance_from_avg = abs(filtered_value - self.avg_filtered_value)
+        if distance_from_avg > self.std_filtered_value:
+            distance_from_avg = self.std_filtered_value
 
-    def update_bar_color(self, bar, value):
-        # Change the color from blue to red based on value
-        r = int((value / 100) * 255)
+        r = int((distance_from_avg / self.std_filtered_value) * 255)
         g = 0
         b = 255 - r
+        self.respiration_strength_bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: rgb({r},{g},{b}); }}")
+
+    def update_harmony_bar(self):
+        if self.respiration_rate_previous is None:
+            return
+
+        current_rate = float(self.rate_label.text().split()[-2])
+        difference = abs(current_rate - self.respiration_rate_previous)
+        percentage_difference = (difference / self.respiration_rate_previous) * 100
+
+        if percentage_difference <= 5:
+            level = 100
+        elif percentage_difference <= 10:
+            level = 90
+        elif percentage_difference <= 20:
+            level = 80
+        elif percentage_difference <= 30:
+            level = 70
+        elif percentage_difference <= 40:
+            level = 60
+        elif percentage_difference <= 50:
+            level = 50
+        elif percentage_difference <= 60:
+            level = 40
+        elif percentage_difference <= 70:
+            level = 30
+        elif percentage_difference <= 80:
+            level = 20
+        elif percentage_difference <= 90:
+            level = 10
+        else:
+            level = 0
+
+        self.harmony_bar.setValue(level)
+        self.update_bar_color(self.harmony_bar, level)
+
+        if level <= 50:
+            self.reminder_label.setText("Breathing too fast!" if current_rate > self.respiration_rate_previous else "Breathing too slow!")
+        else:
+            self.reminder_label.setText("")
+
+    def check_reminder(self):
+        if self.harmony_bar.value() <= 50:
+            print("Reminder: Check your breathing rate!")
+
+    def update_bar_color(self, bar, value):
+        r = 255 - int((value / 100) * 255)
+        g = int((value / 100) * 255)
+        b = 0
         bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: rgb({r},{g},{b}); }}")
 
     def start_plotting(self):
         self.show()
+
 
 def start_signal_plotter(raw_data_queue, rsp_data_queue):
     try:

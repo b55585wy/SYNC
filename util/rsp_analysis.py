@@ -6,7 +6,7 @@ from backend.util.neurokit2 import rsp_process
 
 def signal_analysis(processed_data_queue, rsp_data_queue):
     window_size = 1500
-    step_size = 100
+    step_size = 300
     data_buffer = []
 
     while True:
