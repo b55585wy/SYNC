@@ -25,7 +25,9 @@ class SignalPlotter(QWidget):
         self.queue = raw_data_queue
         self.data = []
         self.max_points = max_points
-
+        self.consecutive_max = 5  # 用于跟踪连续100的计数器
+        self.consecutive_min = 5  # 用于跟踪连续0的计数器
+        self.waiting_for_opposite = False  # 用于跟踪是否在等待相反的值
         self.rsp_analysis_outcome = rsp_data_queue
 
         # Initialize a deque to store the last 500 filtered data points
@@ -270,6 +272,8 @@ class SignalPlotter(QWidget):
                     if self.recording_duration < 0.2:
                         self.respiration_rates.append(rsp_signals["RSP_Rate"].iloc[-1])
                         self.respiration_clean.append(rsp_signals["RSP_Clean"].iloc[-1])
+                        self.avg_respiration_rate = np.mean(self.respiration_rates)
+                        self.std_respiration_rate = np.std(self.respiration_rates)
                         self.recording_duration += self.sampling_interval
 
                     elif self.recording_duration >= 0.2:
@@ -279,7 +283,7 @@ class SignalPlotter(QWidget):
                         self.std_respiration_clean = np.std(self.respiration_clean)
                         respiration_rate = rsp_signals["RSP_Rate"].iloc[-1]
                         self.respiration_rate_previous = respiration_rate
-                        self.rate_label.setText(f"Respiration Rate: {respiration_rate:.2f} breaths/min")
+                        self.rate_label.setText(f"Respiration Rate: {respiration_rate:.1f} breaths/min")
                         self.update_rate_timer.start(10000)
 
                 if self.avg_filtered_value is not None and self.std_filtered_value is not None and self.std_filtered_value != 0:
@@ -289,11 +293,28 @@ class SignalPlotter(QWidget):
 
                     self.update_bar_color_based_on_value(filtered_value)
 
-                    if normalized_value == 100 or normalized_value == 0:
-                        self.reach_max_and_min += 1
-                        if self.reach_max_and_min % 2 == 0:
-                            print(f'Count when reach max and min: {self.reach_max_and_min // 2}')
+                    # 如果 normalized_value 为 100
+                    if normalized_value == 100:
+                        if self.waiting_for_opposite and self.consecutive_min >= 5:
+                            self.reach_max_and_min += 1
+                            print(f'Count when reach max and min: {self.reach_max_and_min}')
                             self.update_harmony_bar()
+                            self.waiting_for_opposite = False  # 重置等待状态
+                            self.consecutive_min = 0  # 重置 min 计数器
+                        else:
+                            self.consecutive_max += 1
+                            self.waiting_for_opposite = True  # 设置等待状态
+                    # 如果 normalized_value 为 0
+                    elif normalized_value == 0:
+                        if self.waiting_for_opposite and self.consecutive_max >= 5:
+                            self.reach_max_and_min += 1
+                            print(f'Count when reach max and min: {self.reach_max_and_min}')
+                            self.update_harmony_bar()
+                            self.waiting_for_opposite = False  # 重置等待状态
+                            self.consecutive_max = 0  # 重置 max 计数器
+                        else:
+                            self.consecutive_min += 1
+                            self.waiting_for_opposite = True  # 设置等待状态
 
     def update_previous_respiration_rate(self):
         if self.respiration_rate_previous is not None:
